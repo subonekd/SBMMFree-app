@@ -19,17 +19,23 @@ st.caption("An interactive matchmaking model — not a reconstruction of Activis
 PERCENTILES = np.array([2, 17, 27, 38, 50, 62, 66, 79, 87, 91, 94, 97, 99, 99.9, 99.98, 99.99])
 KD_ANCHORS = np.array([0.15, 0.40, 0.55, 0.62, 0.78, 0.92, 0.97, 1.12, 1.30, 1.45, 1.58, 1.85, 2.08, 3.57, 4.40, 5.70])
 
-# These are scenario targets, not claims about Activision's actual SBMM brackets.
+# Scenario brackets. Percentile guardrails are intentionally defined against the
+# modeled population rather than arbitrary K/D cutoffs.
 SBMM_TARGETS = {
-    "Protected": {"kd": 0.35, "width": 0.18},
-    "Low": {"kd": 0.60, "width": 0.24},
-    "Medium": {"kd": 0.85, "width": 0.30},
-    "High": {"kd": 1.30, "width": 0.42},
+    "Protected": {"kd": 0.40, "width": 0.18, "min_pct": 0, "max_pct": 30},
+    "Low": {"kd": 0.60, "width": 0.23, "min_pct": 0, "max_pct": 75},
+    "Medium": {"kd": 0.85, "width": 0.28, "min_pct": 25, "max_pct": 97},
+    "High": {"kd": 1.30, "width": 0.38, "min_pct": 55, "max_pct": 100},
 }
 
 
+def kd_at_percentile(pct):
+    xp = np.r_[0.1, PERCENTILES, 100.0]
+    fp = np.r_[0.10, KD_ANCHORS, 6.0]
+    return float(np.interp(pct, xp, fp))
+
+
 def population_sample(n, rng):
-    """Sample a smooth quantile curve fitted to historical/extrapolated anchors."""
     p = rng.uniform(0.1, 99.99, n)
     xp = np.r_[0.1, PERCENTILES, 100.0]
     fp = np.r_[0.10, KD_ANCHORS, 6.0]
@@ -37,7 +43,6 @@ def population_sample(n, rng):
 
 
 def active_pool(n, churn, rng):
-    """Create an active queue after applying the low-skill churn scenario."""
     pool = population_sample(max(n * 10, 1500), rng)
     keep_prob = np.ones(pool.size)
     keep_prob[pool < 0.78] = 1.0 - (churn / 100.0) * 0.75
@@ -45,22 +50,26 @@ def active_pool(n, churn, rng):
 
 
 def weighted_sbmm_sample(pool, n, target_name, rng):
-    """Select from the same population, with probability declining away from target K/D."""
+    """Apply bracket guardrails, then weight eligible players toward the target."""
     target = SBMM_TARGETS[target_name]
-    distance = (pool - target["kd"]) / target["width"]
-    weights = np.exp(-0.5 * distance ** 2)
+    lower = kd_at_percentile(target["min_pct"]) if target["min_pct"] > 0 else -np.inf
+    upper = kd_at_percentile(target["max_pct"]) if target["max_pct"] < 100 else np.inf
+    eligible = pool[(pool >= lower) & (pool <= upper)]
 
-    # A small floor prevents artificial hard walls: out-of-band players are rare, not impossible.
-    weights = weights + 0.015
+    # The active pool is deliberately oversized, but retain a safe fallback.
+    if len(eligible) < n:
+        eligible = pool
+
+    distance = (eligible - target["kd"]) / target["width"]
+    weights = np.exp(-0.5 * distance ** 2)
     weights /= weights.sum()
-    return rng.choice(pool, size=n, replace=False, p=weights)
+    return rng.choice(eligible, size=n, replace=False, p=weights)
 
 
 def build_lobby(mode, lobby_size, bot_pct, churn, target_name, rng):
     bot_count = int(round(lobby_size * bot_pct / 100)) if mode == "Hybrid" else 0
     human_count = lobby_size - bot_count
     pool = active_pool(human_count, churn, rng)
-
     if len(pool) < human_count:
         pool = np.r_[pool, population_sample(human_count * 2, rng)]
 
@@ -83,17 +92,13 @@ def build_lobby(mode, lobby_size, bot_pct, churn, target_name, rng):
 
 
 def lobby_difficulty(values, labels):
-    """Difficulty score used only for same-scenario percentile ranking."""
     humans = values[labels == "Human"]
     if len(humans) == 0:
         humans = values
-    # Median captures the typical opponent while the upper quartile preserves the impact of the strong tail.
     return 0.65 * np.median(humans) + 0.35 * np.quantile(humans, 0.75)
 
 
 def benchmark_lobbies(mode, lobby_size, bot_pct, churn, target_name, count=1000):
-    """Monte Carlo reference distribution. It does not replace the displayed single lobby."""
-    # Fixed reference seed keeps the percentile baseline stable while the displayed lobby changes.
     rng = np.random.default_rng(20260917)
     scores = np.empty(count)
     for i in range(count):
@@ -108,33 +113,26 @@ if "lobby_seed" not in st.session_state:
 with st.sidebar:
     st.header("Build a lobby")
     mode = st.radio("Matchmaking model", ["Open / No SBMM", "Standard SBMM", "Hybrid"], index=0)
-
     target_name = "Medium"
     if mode == "Standard SBMM":
-        target_name = st.radio(
-            "Target skill",
-            ["Protected", "Low", "Medium", "High"],
-            index=2,
-            help="Controls which part of the same underlying player population is favored by matchmaking.",
-        )
+        target_name = st.radio("Target skill", ["Protected", "Low", "Medium", "High"], index=2)
         target = SBMM_TARGETS[target_name]
-        st.caption(f"Target center: ~{target['kd']:.2f} K/D. Players outside the band remain possible.")
+        if target_name == "Protected":
+            st.caption(f"Protected pool: bottom 30% only (up to ~{kd_at_percentile(30):.2f} K/D in this population model).")
+        elif target_name == "Low":
+            st.caption(f"Low pool: weighted near ~{target['kd']:.2f} K/D, capped at the 75th percentile (~{kd_at_percentile(75):.2f}).")
+        elif target_name == "Medium":
+            st.caption(f"Medium pool: 25th–97th percentile (~{kd_at_percentile(25):.2f}–{kd_at_percentile(97):.2f} K/D), weighted near ~{target['kd']:.2f}.")
+        else:
+            st.caption(f"High pool: 55th percentile and above (floor ~{kd_at_percentile(55):.2f} K/D), weighted near ~{target['kd']:.2f}.")
 
     lobby_size = st.slider("Lobby size", 40, 150, 120, 10)
     churn = st.slider("Low-skill churn", 0, 60, 0, 5, help="Models disproportionate loss of below-midline players from the active queue.")
     bot_pct = st.slider("Bot share", 0, 40, 10, 5, disabled=(mode != "Hybrid"))
-
     if st.button("🎲 New Lobby", use_container_width=True, type="primary"):
         st.session_state.lobby_seed = int(np.random.default_rng().integers(1, 2_147_483_647))
-
     with st.expander("Advanced"):
-        seed = st.number_input(
-            "Simulation seed",
-            min_value=1,
-            max_value=2_147_483_647,
-            value=int(st.session_state.lobby_seed),
-            help="Each seed represents one reproducible lobby.",
-        )
+        seed = st.number_input("Simulation seed", min_value=1, max_value=2_147_483_647, value=int(st.session_state.lobby_seed), help="Each seed represents one reproducible lobby.")
         if int(seed) != st.session_state.lobby_seed:
             st.session_state.lobby_seed = int(seed)
 
@@ -153,15 +151,9 @@ with st.spinner("Ranking this lobby against 1,000 comparable simulations..."):
     baseline = benchmark_lobbies(mode, lobby_size, bot_pct, churn, target_name, count=1000)
 current_score = lobby_difficulty(values, labels)
 rank_pct = 100.0 * np.mean(baseline <= current_score)
-low90, high90 = np.quantile(baseline, [0.05, 0.95])
 
 st.markdown("### Where does this lobby rank?")
-st.markdown(
-    f"<div class='rank-box'><b>This lobby is harder than {rank_pct:.0f}% of comparable {mode} lobbies.</b><br>"
-    f"The ranking compares this one seed against 1,000 simulated lobbies using the same lobby size, churn, bot settings, and SBMM target (when applicable). "
-    f"The displayed lobby remains a single random lobby — it is not an average.</div>",
-    unsafe_allow_html=True,
-)
+st.markdown(f"<div class='rank-box'><b>This lobby is harder than {rank_pct:.0f}% of comparable {mode} lobbies.</b><br>The ranking compares this one seed against 1,000 simulated lobbies using the same settings. The displayed lobby remains a single random lobby — it is not an average.</div>", unsafe_allow_html=True)
 
 st.markdown("### Lobby skill distribution")
 bins = np.arange(0, max(3.05, values.max() + .25), .15)
@@ -180,7 +172,8 @@ st.markdown("### Read the result")
 if mode == "Open / No SBMM":
     st.write("This is one random draw from the modeled active population. Repeatedly choose **New Lobby** to see the natural lobby-to-lobby variance that open matchmaking permits.")
 elif mode == "Standard SBMM":
-    st.write(f"This **{target_name}** SBMM scenario favors players near ~{SBMM_TARGETS[target_name]['kd']:.2f} K/D, but draws them from the same underlying population as Open matchmaking. Selection probability falls with skill distance instead of imposing a hard K/D wall.")
+    target = SBMM_TARGETS[target_name]
+    st.write(f"This **{target_name}** scenario first applies percentile guardrails, then favors players near ~{target['kd']:.2f} K/D within that eligible pool. The guardrails prevent implausible cross-bracket outliers while preserving variation inside the bracket.")
 else:
     st.write("Humans are broadly drawn from the active population while hypothetical bots are concentrated in lower-skill bands. Choose **New Lobby** repeatedly to see how much human-skill variance remains under this Hybrid scenario.")
 
@@ -189,24 +182,26 @@ with st.expander("Population model & evidence"):
 **The key statistical distinction**
 
 - **~0.78 K/D:** approximate *midline/common-player* anchor for the historical Warzone population.
-- **~0.92–0.98:** historical figures described as an *average* are not used as the center of the distribution. A right-skewed population can have a middle/common player well below its arithmetic mean.
-- **Global kill/death accounting:** credited player kills and player deaths largely balance. Suicides, falls, gas/environmental deaths, and other uncredited deaths can pull the aggregate ratio below 1. This does not imply that the median player's K/D is ~1.0.
+- **~0.92–0.98:** historical figures described as an *average* are not used as the center of the distribution.
+- **Global kill/death accounting:** credited player kills and player deaths largely balance, but environmental/uncredited deaths can pull the aggregate ratio below 1.
 
 **Data quality**
 
 Current population-wide Warzone data are scarce. The default curve combines historical tracker/Caldera-era information, community-reported percentile anchors, interpolation, and explicit tail extrapolation. Treat it as a plausible population model, not a current census.
 """)
-    anchors = pd.DataFrame({"Percentile": PERCENTILES, "Approx. K/D": KD_ANCHORS})
-    st.dataframe(anchors, hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame({"Percentile": PERCENTILES, "Approx. K/D": KD_ANCHORS}), hide_index=True, use_container_width=True)
 
 with st.expander("Model assumptions"):
-    st.markdown("""
+    st.markdown(f"""
 - **Open / No SBMM:** broad random draw from the modeled active population.
-- **Standard SBMM:** uses the same population but weights selection toward Protected, Low, Medium, or High target skill. The targets and selection widths are scenario assumptions, not measured Activision brackets.
-- **Hybrid:** broad human matchmaking plus hypothetical lower-skill bot support. Bots are allocated 50% / 30% / 20% across three lower-skill bands.
-- **Low-skill churn:** reduces representation of players below the 0.78 midline in the active queue. This is a scenario control, not a measured Warzone churn rate.
-- **Lobby rank:** compares the displayed single lobby with 1,000 Monte Carlo lobbies under identical scenario settings. Difficulty is a composite of human median K/D (65%) and human 75th-percentile K/D (35%), preserving both the typical opponent and upper-skill tail.
-- The model describes consequences of assumptions. It does not identify Call of Duty's proprietary matchmaking rules.
+- **Protected SBMM:** strictly bottom 30% of the modeled population (currently ≤ ~{kd_at_percentile(30):.2f} K/D).
+- **Low SBMM:** bottom 75% only, then weighted toward ~0.60 K/D. This blocks the high-skill tail.
+- **Medium SBMM:** 25th–97th percentile, then weighted toward ~0.85 K/D. This removes the very-low protected population while allowing a limited high tail.
+- **High SBMM:** 55th percentile and above, then weighted toward ~1.30 K/D. This prevents low-skill players from populating high-skill lobbies.
+- **Hybrid:** broad human matchmaking plus hypothetical lower-skill bot support.
+- **Low-skill churn:** reduces representation below the 0.78 midline; it is a scenario control, not a measured Warzone churn rate.
+- **Lobby rank:** compares the displayed lobby with 1,000 Monte Carlo lobbies under identical settings using 65% human median K/D + 35% human 75th-percentile K/D.
+- These bracket boundaries are transparent modeling assumptions, not claims about Activision's proprietary thresholds.
 """)
 
 with st.expander("Reproducibility"):
